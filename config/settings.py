@@ -12,6 +12,7 @@ class Settings:
     spool_max_records: int = 250_000
     log_every: int = 1_000_000
     sample_count: int = 0
+    workers: int = 1
 
     @property
     def phase1_dir(self) -> Path:
@@ -25,6 +26,7 @@ def build_settings(
     spool_max_records: int = 250_000,
     log_every: int = 1_000_000,
     sample_count: int = 0,
+    workers: int = 1,
 ) -> Settings:
     return Settings(
         input_path=Path(input_path),
@@ -33,4 +35,5 @@ def build_settings(
         spool_max_records=spool_max_records,
         log_every=log_every,
         sample_count=sample_count,
+        workers=workers,
     )

@@ -23,6 +23,12 @@ def _add_common_pipeline_args(parser: argparse.ArgumentParser) -> None:
         default=0,
         help="Write up to N example records per category to samples/samples.json (0=off)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel workers for partition-scoped phases (1=sequential, 0=auto)",
+    )
 
 
 def main() -> None:
@@ -114,6 +120,7 @@ def main() -> None:
         spool_max_records=args.spool_max_records,
         log_every=args.log_every,
         sample_count=args.sample_count,
+        workers=args.workers,
     )
 
     if args.command == "phase1":

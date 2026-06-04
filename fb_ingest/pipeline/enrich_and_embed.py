@@ -5,6 +5,7 @@ from pathlib import Path
 
 from config.settings import Settings
 from fb_ingest.batch.manifest import write_manifest
+from fb_ingest.batch.parallel import map_parallel, merge_sample_dicts, resolve_workers
 from fb_ingest.batch.reducers import iter_jsonl, write_jsonl
 from fb_ingest.enrich.descriptions import build_edge_description, build_node_description
 from fb_ingest.enrich.embedder import load_embedder
@@ -36,6 +37,45 @@ class EnrichEmbedSettings:
     skip_embeddings: bool = False
     max_records: int | None = None
     sample_count: int = 0
+    workers: int = 1
+
+
+@dataclass
+class EnrichPartitionTask:
+    kind: str
+    input_path: str
+    output_path: str
+    embedding_batch_size: int
+    skip_embeddings: bool
+    sample_count: int
+    max_rows: int | None = None
+
+
+@dataclass
+class EnrichPartitionResult:
+    stats: dict
+    samples: dict[str, list]
+
+
+_WORKER_EMBEDDER = None
+_WORKER_NAME_INDEX: dict[str, str] = {}
+
+
+def _init_enrich_worker(
+    model_name: str,
+    allow_fallback: bool,
+    skip_embeddings: bool,
+    name_index: dict[str, str],
+) -> None:
+    global _WORKER_EMBEDDER, _WORKER_NAME_INDEX
+    _WORKER_NAME_INDEX = name_index
+    if skip_embeddings:
+        _WORKER_EMBEDDER = None
+    else:
+        _WORKER_EMBEDDER = load_embedder(
+            model_name=model_name,
+            allow_fallback=allow_fallback,
+        )
 
 
 def enrich_embed_paths(work_dir: Path) -> dict[str, Path]:
@@ -78,14 +118,108 @@ def _embed_batch(
     embedder,
     texts: list[str],
     batch_size: int,
-    stats: EnrichEmbedStats,
-) -> list[list[float]]:
+) -> tuple[list[list[float]], int]:
     vectors: list[list[float]] = []
+    batches = 0
     for start in range(0, len(texts), batch_size):
         batch = texts[start : start + batch_size]
         vectors.extend(embedder.encode(batch))
-        stats.embedding_batches += 1
-    return vectors
+        batches += 1
+    return vectors, batches
+
+
+def _enrich_partition(task: EnrichPartitionTask) -> EnrichPartitionResult:
+    rows = list(iter_jsonl(Path(task.input_path)))
+    if task.max_rows is not None:
+        rows = rows[: task.max_rows]
+    stats = EnrichEmbedStats(partitions_processed=1)
+    samples: dict[str, list] = {}
+    sample_cap = task.sample_count
+
+    def add_sample(category: str, record: dict) -> None:
+        if sample_cap <= 0:
+            return
+        bucket = samples.setdefault(category, [])
+        if len(bucket) >= sample_cap:
+            return
+        bucket.append(record)
+
+    if task.kind == "node":
+        descriptions = [build_node_description(row) for row in rows]
+        embeddings: list[list[float]] = []
+        if not task.skip_embeddings and _WORKER_EMBEDDER is not None:
+            embeddings, batch_count = _embed_batch(
+                _WORKER_EMBEDDER,
+                descriptions,
+                task.embedding_batch_size,
+            )
+            stats.embedding_batches = batch_count
+            stats.used_fallback_embedder = (
+                _WORKER_EMBEDDER.__class__.__name__ == "HashFallbackEmbedder"
+            )
+
+        enriched_rows = []
+        for idx, row in enumerate(rows):
+            props = dict(row.get("properties") or {})
+            props["description"] = descriptions[idx]
+            if embeddings:
+                props["embedding"] = embeddings[idx]
+            enriched = dict(row)
+            enriched["properties"] = props
+            enriched_rows.append(enriched)
+            stats.nodes_enriched += 1
+            add_sample("enriched_node", enriched)
+    else:
+        descriptions = [
+            build_edge_description(
+                row,
+                source_name=_WORKER_NAME_INDEX.get(row.get("source_mid", "")),
+                target_name=_WORKER_NAME_INDEX.get(row.get("target_mid", "")),
+            )
+            for row in rows
+        ]
+        embeddings = []
+        if not task.skip_embeddings and _WORKER_EMBEDDER is not None:
+            embeddings, batch_count = _embed_batch(
+                _WORKER_EMBEDDER,
+                descriptions,
+                task.embedding_batch_size,
+            )
+            stats.embedding_batches = batch_count
+            stats.used_fallback_embedder = (
+                _WORKER_EMBEDDER.__class__.__name__ == "HashFallbackEmbedder"
+            )
+
+        enriched_rows = []
+        for idx, row in enumerate(rows):
+            props = dict(row.get("properties") or {})
+            props["description"] = descriptions[idx]
+            if embeddings:
+                props["embedding"] = embeddings[idx]
+            enriched = dict(row)
+            enriched["properties"] = props
+            enriched_rows.append(enriched)
+            stats.edges_enriched += 1
+            if (row.get("properties") or {}).get("cvt_mid"):
+                add_sample("enriched_cvt_edge", enriched)
+            else:
+                add_sample("enriched_direct_edge", enriched)
+
+    write_jsonl(Path(task.output_path), enriched_rows)
+    return EnrichPartitionResult(stats=asdict(stats), samples=samples)
+
+
+def _merge_enrich_stats(results: list[EnrichPartitionResult]) -> EnrichEmbedStats:
+    merged = EnrichEmbedStats()
+    for result in results:
+        stats = result.stats
+        merged.partitions_processed += stats.get("partitions_processed", 0)
+        merged.nodes_enriched += stats.get("nodes_enriched", 0)
+        merged.edges_enriched += stats.get("edges_enriched", 0)
+        merged.embedding_batches += stats.get("embedding_batches", 0)
+        if stats.get("used_fallback_embedder"):
+            merged.used_fallback_embedder = True
+    return merged
 
 
 def run_enrich_and_embed(settings: EnrichEmbedSettings) -> dict:
@@ -97,97 +231,93 @@ def run_enrich_and_embed(settings: EnrichEmbedSettings) -> dict:
     logger = get_logger("fb_ingest.enrich_and_embed")
     input_nodes_dir, input_edges_dir = _resolve_input_dirs(settings)
     output = enrich_embed_paths(settings.work_dir)
-    stats = EnrichEmbedStats()
     samples = SampleCollector(settings.sample_count)
-
-    embedder = None
-    if not settings.skip_embeddings:
-        embedder = load_embedder(
-            model_name=settings.embedding_model,
-            allow_fallback=settings.allow_fallback_embedder,
-        )
-        stats.used_fallback_embedder = embedder.__class__.__name__ == "HashFallbackEmbedder"
 
     name_index = _load_name_index(input_nodes_dir)
 
-    node_files = sorted(input_nodes_dir.glob("nodes_*.jsonl"))
-    for node_path in node_files:
-        rows = list(iter_jsonl(node_path))
-        if settings.max_records is not None:
-            remaining = settings.max_records - stats.nodes_enriched
-            if remaining <= 0:
-                break
-            rows = rows[:remaining]
-
-        descriptions = [build_node_description(row) for row in rows]
-        embeddings: list[list[float]] = []
-        if not settings.skip_embeddings:
-            embeddings = _embed_batch(
-                embedder,
-                descriptions,
-                settings.embedding_batch_size,
-                stats,
+    tasks: list[EnrichPartitionTask] = []
+    nodes_remaining = settings.max_records
+    for node_path in sorted(input_nodes_dir.glob("nodes_*.jsonl")):
+        if nodes_remaining is not None and nodes_remaining <= 0:
+            break
+        max_rows = None
+        if nodes_remaining is not None:
+            row_count = sum(1 for _ in iter_jsonl(node_path))
+            max_rows = min(row_count, nodes_remaining)
+            nodes_remaining -= max_rows
+        tasks.append(
+            EnrichPartitionTask(
+                kind="node",
+                input_path=str(node_path),
+                output_path=str(output["nodes"] / node_path.name),
+                embedding_batch_size=settings.embedding_batch_size,
+                skip_embeddings=settings.skip_embeddings,
+                sample_count=settings.sample_count,
+                max_rows=max_rows,
             )
+        )
 
-        enriched_rows = []
-        for idx, row in enumerate(rows):
-            description = descriptions[idx]
-            props = dict(row.get("properties") or {})
-            props["description"] = description
-            if not settings.skip_embeddings:
-                props["embedding"] = embeddings[idx]
-            enriched = dict(row)
-            enriched["properties"] = props
-            enriched_rows.append(enriched)
-            stats.nodes_enriched += 1
-            samples.add("enriched_node", enriched)
-
-        write_jsonl(output["nodes"] / node_path.name, enriched_rows)
-        stats.partitions_processed += 1
-
-    edge_files = sorted(input_edges_dir.glob("edges_*.jsonl"))
-    for edge_path in edge_files:
-        rows = list(iter_jsonl(edge_path))
-        if settings.max_records is not None:
-            remaining = settings.max_records - stats.edges_enriched
-            if remaining <= 0:
-                break
-            rows = rows[:remaining]
-
-        descriptions = [
-            build_edge_description(
-                row,
-                source_name=name_index.get(row.get("source_mid", "")),
-                target_name=name_index.get(row.get("target_mid", "")),
+    edges_remaining = settings.max_records
+    for edge_path in sorted(input_edges_dir.glob("edges_*.jsonl")):
+        if edges_remaining is not None and edges_remaining <= 0:
+            break
+        max_rows = None
+        if edges_remaining is not None:
+            row_count = sum(1 for _ in iter_jsonl(edge_path))
+            max_rows = min(row_count, edges_remaining)
+            edges_remaining -= max_rows
+        tasks.append(
+            EnrichPartitionTask(
+                kind="edge",
+                input_path=str(edge_path),
+                output_path=str(output["edges"] / edge_path.name),
+                embedding_batch_size=settings.embedding_batch_size,
+                skip_embeddings=settings.skip_embeddings,
+                sample_count=settings.sample_count,
+                max_rows=max_rows,
             )
-            for row in rows
-        ]
-        embeddings = []
-        if not settings.skip_embeddings:
-            embeddings = _embed_batch(
-                embedder,
-                descriptions,
-                settings.embedding_batch_size,
-                stats,
-            )
+        )
 
-        enriched_rows = []
-        for idx, row in enumerate(rows):
-            description = descriptions[idx]
-            props = dict(row.get("properties") or {})
-            props["description"] = description
-            if not settings.skip_embeddings:
-                props["embedding"] = embeddings[idx]
-            enriched = dict(row)
-            enriched["properties"] = props
-            enriched_rows.append(enriched)
-            stats.edges_enriched += 1
-            if (row.get("properties") or {}).get("cvt_mid"):
-                samples.add("enriched_cvt_edge", enriched)
-            else:
-                samples.add("enriched_direct_edge", enriched)
+    worker_count = resolve_workers(settings.workers)
+    logger.info(
+        "Enrichment: processing %s partitions (workers=%s)",
+        len(tasks),
+        worker_count,
+    )
 
-        write_jsonl(output["edges"] / edge_path.name, enriched_rows)
+    initargs = (
+        settings.embedding_model,
+        settings.allow_fallback_embedder,
+        settings.skip_embeddings,
+        name_index,
+    )
+
+    if worker_count == 1:
+        _init_enrich_worker(*initargs)
+        results = [_enrich_partition(task) for task in tasks]
+    else:
+        results = map_parallel(
+            tasks,
+            _enrich_partition,
+            workers=settings.workers,
+            label="enrich partitions",
+            initializer=_init_enrich_worker,
+            initargs=initargs,
+        )
+
+    stats = _merge_enrich_stats(results)
+    if not settings.skip_embeddings and results:
+        stats.used_fallback_embedder = any(
+            r.stats.get("used_fallback_embedder") for r in results
+        )
+
+    merged_samples: dict[str, list] = {}
+    for result in results:
+        merge_sample_dicts(merged_samples, result.samples)
+
+    for category, records in merged_samples.items():
+        for record in records[: settings.sample_count]:
+            samples.add(category, record)
 
     stats_path = output["stats"] / "enrich_embed_stats.json"
     write_stats(stats, stats_path)
@@ -202,6 +332,7 @@ def run_enrich_and_embed(settings: EnrichEmbedSettings) -> dict:
         "embedding_batch_size": settings.embedding_batch_size,
         "skip_embeddings": settings.skip_embeddings,
         "max_records": settings.max_records,
+        "workers": settings.workers,
         "stats": asdict(stats),
         "artifacts": {
             "nodes_dir": str(output["nodes"]),
@@ -224,6 +355,7 @@ def run_enrich_and_embed_from_settings(settings: Settings, **kwargs) -> dict:
         work_dir=settings.work_dir,
         partition_count=settings.partition_count,
         sample_count=settings.sample_count,
+        workers=settings.workers,
         **kwargs,
     )
     return run_enrich_and_embed(enrich_settings)
