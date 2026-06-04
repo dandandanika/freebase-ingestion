@@ -10,7 +10,7 @@ from fb_ingest.batch.partitioning import stable_partition
 from fb_ingest.batch.spool import JsonlSpoolManager
 from fb_ingest.logging_utils import get_logger
 from fb_ingest.models import Phase1Stats
-from fb_ingest.parse.ntriples import TripleParseError, parse_preprocessed_line
+from fb_ingest.parse.ntriples import TripleParseError, parse_line_auto
 from fb_ingest.parse.reader import iter_lines
 from fb_ingest.paths import phase1_paths
 from fb_ingest.schema.predicate_catalog import write_predicate_catalog
@@ -43,7 +43,7 @@ def run_phase1(settings: Settings) -> dict:
     try:
         for line_no, line in iter_lines(Path(settings.input_path)):
             try:
-                triple = parse_preprocessed_line(line, line_no)
+                triple = parse_line_auto(line, line_no)
             except TripleParseError:
                 stats.parse_errors += 1
                 continue

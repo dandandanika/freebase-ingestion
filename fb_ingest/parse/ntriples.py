@@ -56,7 +56,10 @@ FREEBASE_NS = "http://rdf.freebase.com/ns/"
 
 def parse_line_auto(line: str, line_no: int) -> Triple:
     """
-    Parse either preprocessed TSV or raw N-Triples-like Freebase lines.
+    Parse preprocessed short-path TSV or N-Triples-style lines (space/tab, with URIs).
+
+    Normalizes http://rdf.freebase.com/ns/... URIs to /slash/path form for schema
+    and CVT detection.
     """
     if "\t" in line and not line.lstrip().startswith("<"):
         return parse_preprocessed_line(line, line_no)

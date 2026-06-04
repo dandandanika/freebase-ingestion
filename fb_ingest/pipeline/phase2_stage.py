@@ -18,7 +18,7 @@ from fb_ingest.cvt.detector import Phase1Artifacts
 from fb_ingest.logging_utils import get_logger
 from fb_ingest.models import Phase2StageStats
 from fb_ingest.parse.literals import parse_typed_literal
-from fb_ingest.parse.ntriples import TripleParseError, parse_preprocessed_line
+from fb_ingest.parse.ntriples import TripleParseError, parse_line_auto
 from fb_ingest.parse.reader import iter_lines
 from fb_ingest.paths import ensure_dir
 from fb_ingest.transform.canonicalize import PredicateCanonicalizer
@@ -125,7 +125,7 @@ def run_phase2_stage(settings: Settings) -> dict:
     try:
         for line_no, line in iter_lines(settings.input_path):
             try:
-                triple = parse_preprocessed_line(line, line_no)
+                triple = parse_line_auto(line, line_no)
             except TripleParseError:
                 stats.parse_errors += 1
                 continue
