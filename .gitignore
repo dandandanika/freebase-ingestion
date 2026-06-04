@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+
+# Pipeline outputs (regeneratable)
+testdata/work*/
+**/phase1/
+**/phase2/
+**/phase3/
+
+# Large generated inputs (regenerate with scripts/generate_sample_data.py)
+testdata/*.nt
+
+# Secrets
+.env
+*.pem
